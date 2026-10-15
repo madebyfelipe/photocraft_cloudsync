@@ -27,6 +27,7 @@ mod appearance;
 mod apple_events;
 mod caps_lock;
 mod caption_style;
+mod cloud_sync;
 mod control_server;
 mod crash_guard;
 mod cursor;
@@ -377,7 +378,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             created_in_callback.store(true, std::sync::atomic::Ordering::Relaxed);
             let automation = control.as_ref().map(|(_, _, workspace)| workspace.clone());
-            let mut services = services::native(automation);
+            let mut services = services::native(automation.clone());
             services.preset_store = presets;
             #[cfg(target_os = "linux")]
             let display = tablet::DisplayKind::of(cc);
@@ -519,7 +520,7 @@ fn main() -> eframe::Result {
             if let Some(w) = &app_dirs::current().warning {
                 photocraft_ui_egui::notices::post(&mut app, "Portable mode is off", vec![w.clone()], false, None);
             }
-            Ok(Box::new(app))
+            Ok(Box::new(cloud_sync::DesktopApp::new(app, automation)))
         }),
     );
     // Closed or failed outside graphics initialization: not a driver crash. A renderer error

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["cloud-sync"]
 members = ["crates/*", "apps/*", "xtask"]
 default-members = ["crates/*", "apps/photocraft", "apps/photocraft-cli", "xtask"]
 

@@ -1,0 +1,50 @@
+name: craft-cloud
+services:
+  webdav:
+    image: rclone/rclone:1.73.0@sha256:9f59fda717a48aced38d7f27e9ec8fd9992b5651e7a03897bebf204d3a9197d6
+    command: [serve, webdav, /data, --addr, ':8080', --htpasswd, /run/auth/htpasswd, --vfs-cache-mode, 'off', --dir-cache-time, 1s, --log-level, NOTICE]
+    restart: unless-stopped
+    environment:
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+    volumes:
+      - ./data:/data
+      - ./secrets/htpasswd:/run/auth/htpasswd:ro
+    networks: [dav]
+    healthcheck:
+      test: [CMD-SHELL, "wget -Y off -S -O /dev/null http://127.0.0.1:8080/ 2>&1 | grep -q '401 Unauthorized'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    environment:
+      DAV_DOMAIN: ${DAV_DOMAIN:?Configure DAV_DOMAIN no arquivo .env}
+      NO_PROXY: webdav,localhost,127.0.0.1
+      no_proxy: webdav,localhost,127.0.0.1
+    ports: ['80:80', '443:443']
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge, dav]
+    depends_on:
+      webdav: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, 'wget -Y off -q -O /dev/null http://127.0.0.1:2019/config/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}
+networks:
+  edge: {}
+  dav: {internal: true}
+volumes:
+  caddy_data: {}
+  caddy_config: {}

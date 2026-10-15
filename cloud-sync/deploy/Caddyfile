@@ -1,0 +1,3 @@
+{$DAV_DOMAIN} {
+	reverse_proxy webdav:8080
+}
