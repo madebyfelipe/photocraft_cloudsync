@@ -24,7 +24,7 @@ Os testes do cliente verificam fila durável, idempotência após reinício, int
 
 O teste rclone externo é opt-in porque exige serviço descartável autenticado; não executar fixtures em armazenamento pessoal. Os serviços e credenciais de teste foram removidos. Credenciais nunca fazem parte da configuração salva.
 
-Não executado: implantação Contabo, teste em dois computadores físicos, Windows/macOS e cofre nativo nesses sistemas. A suíte local não substitui esses testes de aceitação. O limite de snapshot é 256 MiB e não há coleta automática de histórico.
+Na validação original acima, não foram executados: implantação Contabo, teste em dois computadores físicos, Windows/macOS e cofre nativo nesses sistemas. A suíte local não substitui esses testes de aceitação. O limite de snapshot é 256 MiB e não há coleta automática de histórico.
 
 A execução real encontrou e corrigiu a abertura PhotoCraft em sessão vazia: o adaptador agora chama `sync_views` ao adicionar o documento, antes do próximo desenho. O nono teste cobre esse ciclo. O setup também passou a extrair o runtime DBus e desabilitar MIT-SHM no Xvfb, necessários neste contêiner. Captura PhotoCraft: `/workspace/cloud-setup/photocraft-cloud-reopened.png`.
 
@@ -36,4 +36,28 @@ Reexecução integral de `bash /workspace/cloud-setup/install.sh`: exit 0. Rust/
 
 Antes da publicação na main: `cargo xtask layers` passou nos dois repositórios. `cargo xtask ci` do VectorCraft passou em fmt e parou no Clippy pela mesma falha preexistente `crates/pdf/src/import_scan.rs:549` (`collapsible_match`); seus estágios seguintes foram ignorados pelo runner. Os testes específicos e o smoke descritos acima foram executados separadamente.
 
+## Execução local e VPS — 2026-10-15
+
+Rust 1.95.0 em contêiner Podman local, separado do ambiente gerenciado original.
+Backend implantado na VPS `169.58.121.151`, pasta `~/artcraft-cloud-sync`, com o
+serviço rclone do compose existente, sem segundo proxy nem porta pública no backend.
+O fingerprint ED25519 informado pelo proprietário confere; o contêiner está saudável.
+
+| Verificação desta sessão | Resultado |
+|---|---|
+| `cargo test --locked` em `cloud-sync/` | 12 aprovados; 1 externo ignorado na suíte normal |
+| `real_rclone_two_clients_and_offline_restart`, executado explicitamente contra a VPS via túnel SSH | 1 aprovado em 54,92 s |
+| Dois caches isolados | Envio/recuperação de payloads sintéticos e dois heads concorrentes preservados |
+| Cliente compartilhado após reinício offline | Fila reenviada e bytes recuperados |
+| Limpeza da coleção descartável privada | HTTP DELETE 204 |
+| Conta operacional no cofre local Secret Service/KWallet | Gravação e leitura conferidas sem expor a senha |
+| HTTPS/preflight público | Aprovado em `https://cloudsync.madebyfelipe.agency/`, certificado Let’s Encrypt, TLS verificado |
+
+Os serviços preexistentes da VPS permaneceram ativos sem reinício. Nenhuma chave
+SSH privada foi copiada ou exibida. Os testes acima usam dois clientes no mesmo
+computador e não equivalem a dois desktops físicos. Builds, adaptadores e smoke
+dos aplicativos nesta sessão ainda estão em andamento.
+
 Clippy amplo PhotoCraft (`cargo clippy --locked -p photocraft --all-targets -- -D warnings`) também parou em falha preexistente fora das alterações: `crates/raw/src/cr3.rs:145`, `collapsible_match`. O Clippy do pacote com `--no-deps` e o Clippy estrito do cliente compartilhado passaram conforme registrado acima.
+
+O preflight público foi executado após a emissão do certificado e passou: PROPFIND, PUT, MOVE com Overwrite:F, resposta 412 ao tentar sobrescrever e verificação de ambos os conteúdos. Por solicitação do proprietário, os testes nativos restantes e a repetição pública da suíte de dois clientes foram dispensados em favor dos builds release. Os 9 testes do adaptador PhotoCraft passaram nesta sessão; não se afirma a conclusão do adaptador VectorCraft ou de recuperação/reconexão dos desktops.

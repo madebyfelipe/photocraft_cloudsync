@@ -24,8 +24,9 @@ Testes dos adaptadores: PhotoCraft 9 aprovados e VectorCraft 10 aprovados; Clipp
 
 ## Limites e pré-requisitos
 
-- VPS ainda não acessada; faltam domínio/DNS, implantação HTTPS, conta e backup externo.
+- VPS acessada em 2026-10-15, fingerprint ED25519 conferido. Backend rclone implantado e saudável em `~/artcraft-cloud-sync`, na rede interna `artcraft_cloud_dav`, sem porta publicada. A conta dedicada foi criada com hash bcrypt e a credencial operacional foi salva no cofre seguro local. A rota `cloudsync.madebyfelipe.agency` foi validada e adicionada ao Caddy existente por reload, sem recriação. O proprietário criou o registro A; certificado público Let’s Encrypt emitido e preflight HTTPS original aprovado. Backup externo permanece pendente.
 - Nenhum teste em dois computadores físicos foi executado.
+- Nesta sessão local, a suíte compartilhada passou novamente (12 testes); o teste externo existente também passou contra a VPS por túnel SSH privado, com dois caches isolados, dois ramos concorrentes preservados e retomada após reinício offline (54,92 s). A coleção descartável foi removida. Isso ainda não valida o endereço HTTPS público nem documentos nativos entre desktops.
 - Servidor e usuário são persistidos sem senha. Quando disponível, o cofre seguro do sistema guarda a credencial e permite reconexão automática; sem ele, a credencial vale somente para a sessão.
 - Para compilar, VectorCraft depende provisoriamente do checkout irmão PhotoCraft para o cliente compartilhado; os executáveis distribuídos não exigem esses checkouts.
 - Snapshots limitados a 256 MiB; histórico e uploads temporários interrompidos não têm coleta automática. Acompanhar armazenamento e fazer backup.
@@ -36,4 +37,10 @@ Testes dos adaptadores: PhotoCraft 9 aprovados e VectorCraft 10 aprovados; Clipp
 
 ## Ambiente reutilizável
 
-`/workspace/cloud-setup/install.sh` foi reexecutado integralmente com exit 0; inicialização gráfica e fluxos nativos foram exercitados. `install_script` e `start_skill` completos salvos no rascunho do ambiente. O usuário ainda precisa revisar/salvar nas configurações e publicar. Nenhuma restauração em nova tarefa foi verificada. A implantação na VPS não foi realizada; o usuário optou por continuar a execução e a implantação localmente. O guia de execução está em `cloud-sync/README.md`.
+`/workspace/cloud-setup/install.sh` foi reexecutado integralmente com exit 0; inicialização gráfica e fluxos nativos foram exercitados. `install_script` e `start_skill` completos salvos no rascunho do ambiente. O usuário ainda precisa revisar/salvar nas configurações e publicar. Nenhuma restauração em nova tarefa foi verificada. Na preparação original, a implantação na VPS não foi realizada; ela foi iniciada nesta sessão local conforme o estado operacional acima. O guia de execução está em `cloud-sync/README.md`.
+
+## Escopo final desta sessão local
+
+Por solicitação do proprietário para economizar o limite, os testes restantes foram interrompidos para priorizar os executáveis release dos dois aplicativos. Os 9 testes do adaptador PhotoCraft passaram novamente; o build de desenvolvimento e a criação de um checkpoint nativo local foram executados. Recuperação/reconexão do desktop e os testes VectorCraft desta sessão não foram concluídos. Endpoint/usuário dos dois perfis locais padrão foram configurados, com senha no cofre seguro. Os builds release estão em execução em `../artcraft-cloud-ops/`, com LTO desativado para acelerar a compilação.
+
+HTTPS público concluído: `https://cloudsync.madebyfelipe.agency/`; preflight original aprovado com TLS verificado, PROPFIND, PUT, MOVE, recusa de sobrescrita 412 e ambos os conteúdos preservados.
