@@ -26,6 +26,16 @@ e disco cheio conservam cópia local e operações pendentes. O cliente valida
 manifestos, caminhos, limites de tamanho e hash antes de instalar um arquivo
 baixado; não confia em nomes ou metadados recebidos.
 
+Extensões compatíveis do esquema 1 (HOME-01): o manifesto pode trazer `created_ms` e
+`preview` (tamanho e SHA-256 de um PNG de até 512 KiB, publicado como
+`<version-uuid>.preview` depois do snapshot e antes do manifesto). Clientes antigos
+ignoram os campos; um cache gravado sem eles é promovido sem erro, qualquer outra
+diferença continua sendo violação de imutabilidade. A sincronização baixa somente
+manifestos e prévias; o snapshot é baixado sob demanda (`request_payload`), verificado
+por tamanho e SHA-256. O cache de snapshots tem limite (2 GiB por padrão) e remove as
+cópias menos usadas, nunca edições pendentes, revisões abertas, cabeças de conflito ou
+revisões ainda não confirmadas no servidor; manifestos, prévias e o diário permanecem.
+
 Consequências: servidor pequeno e operável, histórico recuperável e suporte
 posterior a outros aplicativos Craft. Snapshots completos consomem disco/banda;
 o histórico precisa de retenção explícita e backup externo consistente. HTTPS

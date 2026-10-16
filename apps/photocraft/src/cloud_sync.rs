@@ -1,6 +1,6 @@
 //! Desktop cloud shell. Snapshot capture is cheap; serialization, linked-file reads, durable
 //! checkpoints, opening and the sync client all run on the worker, independently of Save/recovery.
-use craft_cloud_sync::{Config, DownloadedRevision, Snapshot, SyncService, SyncStatus};
+use craft_cloud_sync::{Config, DownloadedRevision, Snapshot, SyncEvent, SyncService, SyncStatus};
 use photocraft_doc::{DocId, Document, Layer, LayerContent, SmartSource};
 use photocraft_ui_egui::PhotocraftApp;
 use serde_json::{Value, json};
@@ -666,7 +666,9 @@ fn retry_pending(dir: &Path, service: &SyncService) -> Vec<String> {
             if metadata["sha256"].as_str() != Some(hash.as_str()) {
                 return Err("Saved locally; pending checkpoint checksum differs; preserved for recovery".into());
             }
-            service.submit(Snapshot { local_key: key, title, extension: "pcraft".into(), local_token: token, native }).map_err(|e| e.to_string())?;
+            service
+                .submit(Snapshot { local_key: key, title, extension: "pcraft".into(), local_token: token, native, preview: None })
+                .map_err(|e| e.to_string())?;
             metadata["needs_submit"] = json!(false);
             atomic_write(&path, &serde_json::to_vec(&metadata).map_err(|e| e.to_string())?)?;
             Ok::<(), String>(())
@@ -676,6 +678,38 @@ fn retry_pending(dir: &Path, service: &SyncService) -> Vec<String> {
         }
     }
     errors
+}
+
+/// A cloud open waiting for its revision payload to download.
+struct AwaitedOpen {
+    key: String,
+    binding: (Uuid, Uuid),
+}
+fn take_awaited(waiting: &mut Vec<AwaitedOpen>, version: Uuid) -> Vec<AwaitedOpen> {
+    let (done, rest) = std::mem::take(waiting).into_iter().partition(|open| open.binding.1 == version);
+    *waiting = rest;
+    done
+}
+fn open_project(
+    path: &Path,
+    key: String,
+    binding: Option<(Uuid, Uuid)>,
+    service: Option<&SyncService>,
+    automation: Option<&photocraft_automation::AuthorizedWorkspace>,
+    dir: &Path,
+) -> Reply {
+    let result = crate::crash_guard::guard("Open cloud project", || {
+        let document = load_native_project_with_access(path, automation)?;
+        if let Some((project, version)) = binding {
+            service.ok_or("Sync queue unavailable; try opening the local working copy")?.bind(&key, project, version).map_err(|e| e.to_string())?;
+        }
+        Ok(document)
+    });
+    let source = std::fs::read(dir.join("working").join(format!("{key}.json")))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.get("source").and_then(Value::as_str).map(str::to_owned));
+    Reply::Opened { key, source, from_cloud: binding.is_some(), result: result.map(Box::new) }
 }
 
 fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: PathBuf, automation: Option<photocraft_automation::AuthorizedWorkspace>) {
@@ -740,6 +774,7 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
         }
     };
     let mut next_retry = Instant::now();
+    let mut awaiting: Vec<AwaitedOpen> = Vec::new();
     loop {
         if Instant::now() >= next_retry {
             if let Some(service) = &service {
@@ -772,7 +807,7 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
                     service
                         .as_ref()
                         .ok_or("Saved locally; sync queue unavailable")?
-                        .submit(Snapshot { local_key: key.clone(), title: doc.name.clone(), extension: "pcraft".into(), local_token, native })
+                        .submit(Snapshot { local_key: key.clone(), title: doc.name.clone(), extension: "pcraft".into(), local_token, native, preview: None })
                         .map_err(|e| e.to_string())?;
                     metadata["needs_submit"] = json!(false);
                     atomic_write(&metadata_path, &serde_json::to_vec(&metadata).map_err(|e| e.to_string())?)?;
@@ -785,6 +820,10 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
                 let public = json!({"endpoint":config.endpoint,"username":config.username});
                 if let Some(service) = &mut service {
                     service.shutdown();
+                }
+                if !awaiting.is_empty() {
+                    awaiting.clear();
+                    let _ = replies.send(Reply::Error("Cloud download interrupted by reconnecting; open the project again".into()));
                 }
                 match SyncService::new(config, dir.join("sync"), "photocraft") {
                     Ok(s) => {
@@ -829,24 +868,16 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
                     }
                 }
             }
-            Ok(Command::Open { path, key, binding }) => {
-                let result = crate::crash_guard::guard("Open cloud project", || {
-                    let document = load_native_project_with_access(&path, automation.as_ref())?;
-                    if let Some((project, version)) = binding {
-                        service
-                            .as_ref()
-                            .ok_or("Sync queue unavailable; try opening the local working copy")?
-                            .bind(&key, project, version)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    Ok(document)
-                });
-                let source = std::fs::read(dir.join("working").join(format!("{key}.json")))
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                    .and_then(|v| v.get("source").and_then(Value::as_str).map(str::to_owned));
-                let _ = replies.send(Reply::Opened { key, source, from_cloud: binding.is_some(), result: result.map(Box::new) });
-            }
+            Ok(Command::Open { path, key, binding }) => match (binding, service.as_ref()) {
+                (Some(bound), Some(sync)) => {
+                    // The revision may not be cached: ask for the payload and finish the open when it arrives.
+                    awaiting.push(AwaitedOpen { key, binding: bound });
+                    sync.request_payload(bound.1);
+                }
+                _ => {
+                    let _ = replies.send(open_project(&path, key, binding, service.as_ref(), automation.as_ref(), &dir));
+                }
+            },
             Ok(Command::Refresh) => {
                 if let Some(service) = &service {
                     service.request_sync();
@@ -871,8 +902,22 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
             ..Default::default()
         });
         for event in state.events {
-            if let craft_cloud_sync::SyncEvent::Error(message) = event {
-                let _ = replies.send(Reply::Error(message));
+            match event {
+                SyncEvent::Error(message) => {
+                    let _ = replies.send(Reply::Error(message));
+                }
+                SyncEvent::Fetched { version_id, path, .. } => {
+                    // Payloads download on demand; finish the opens that were waiting for this one.
+                    for open in take_awaited(&mut awaiting, version_id) {
+                        let _ = replies.send(open_project(&path, open.key, Some(open.binding), service.as_ref(), automation.as_ref(), &dir));
+                    }
+                }
+                SyncEvent::FetchFailed { version_id, error } => {
+                    if !take_awaited(&mut awaiting, version_id).is_empty() {
+                        let _ = replies.send(Reply::Error(format!("Cannot open the cloud project: {error}")));
+                    }
+                }
+                _ => {}
             }
         }
         let _ = replies.send(Reply::State { status: state.status, pending: state.pending, catalog: state.catalog, local: local_copies(&dir.join("working")) });
@@ -1204,6 +1249,54 @@ mod tests {
         assert_eq!(blocked["portable"], false);
         assert_eq!(blocked["needs_submit"], false);
         restarted.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn cloud_open_waits_for_the_on_demand_payload() {
+        let open = |n: u8| AwaitedOpen { key: format!("cloud-{n}"), binding: (Uuid::from_u128(1), Uuid::from_u128(u128::from(n))) };
+        let mut waiting = vec![open(1), open(2), open(1)];
+        let taken = take_awaited(&mut waiting, Uuid::from_u128(1));
+        assert_eq!(taken.len(), 2);
+        assert_eq!(waiting.len(), 1);
+        assert!(take_awaited(&mut waiting, Uuid::from_u128(9)).is_empty());
+        let dir = std::env::temp_dir().join(format!("photocraft-cloud-lazy-{}", Uuid::new_v4()));
+        let (tx, commands) = mpsc::channel();
+        let (replies, rx) = mpsc::channel();
+        let worker_dir = dir.clone();
+        let handle = std::thread::spawn(move || worker(commands, replies, worker_dir, None));
+        tx.send(Command::Save { key: "doc".into(), doc: Arc::new(doc()), revision: 1, token: "lazy-open".into(), source: None }).unwrap();
+        let revision = loop {
+            if let Reply::State { catalog, .. } = rx.recv_timeout(Duration::from_secs(10)).unwrap()
+                && let Some(revision) = catalog.into_iter().next()
+            {
+                break revision;
+            }
+        };
+        // A cached revision completes through the sync service's Fetched event and is bound for continued editing.
+        tx.send(Command::Open { path: revision.local_path.clone(), key: "cloud-open".into(), binding: Some((revision.project_id, revision.version_id)) })
+            .unwrap();
+        loop {
+            if let Reply::Opened { key, from_cloud, result, .. } = rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                assert!(key == "cloud-open" && from_cloud);
+                result.unwrap();
+                break;
+            }
+        }
+        // A revision the service does not know is reported as a failed download, not as a missing file.
+        tx.send(Command::Open { path: dir.join("sync/payloads/absent"), key: "cloud-absent".into(), binding: Some((revision.project_id, Uuid::new_v4())) })
+            .unwrap();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Reply::Error(e) if e.contains("Cannot open the cloud project") => {
+                    assert!(e.contains("not in the catalog"), "{e}");
+                    break;
+                }
+                Reply::Opened { .. } => panic!("opened a revision without a payload"),
+                _ => {}
+            }
+        }
+        tx.send(Command::Stop).unwrap();
+        handle.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
