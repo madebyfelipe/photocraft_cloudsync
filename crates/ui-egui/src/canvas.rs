@@ -2688,6 +2688,12 @@ fn open_on_double_click(app: &mut PhotocraftApp, ui: &egui::Ui, area: Rect) {
 }
 
 fn start_screen(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
+    // A shell with its own project library draws it here instead of the stock start screen.
+    if let Some(mut view) = app.services.home_view.take() {
+        view(ui);
+        app.services.home_view = Some(view);
+        return;
+    }
     let t = crate::theme::Tokens::get(ui.ctx());
     let area = ui.available_rect_before_wrap();
     paint_dots(ui, area, app.session.prefs().interface.show_canvas_dots);

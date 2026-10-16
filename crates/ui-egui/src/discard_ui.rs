@@ -59,7 +59,11 @@ fn discarded(app: &PhotocraftApp, id: &str, params: &Value) -> (Option<DocId>, V
         Some(Reach::All) => (0..docs.len()).collect(),
         None => Vec::new(),
     };
-    let dirty = affected.into_iter().filter_map(|i| docs.get(i)).filter(|d| d.is_dirty()).map(|d| d.doc.id).collect();
+    // Ask the shell once for the whole operation: cloud flushes then share one bounded wait instead
+    // of blocking for that full duration once per dirty document.
+    let dirty: Vec<_> = affected.into_iter().filter_map(|i| docs.get(i)).filter(|d| d.is_dirty()).collect();
+    let safe: std::collections::HashSet<_> = app.services.discardable_documents(&dirty).into_iter().collect();
+    let dirty = dirty.into_iter().filter(|d| !safe.contains(&d.doc.id)).map(|d| d.doc.id).collect();
     (target.and_then(|i| docs.get(i)).map(|d| d.doc.id), dirty)
 }
 
@@ -101,6 +105,11 @@ fn show_tab(app: &mut PhotocraftApp, doc: Option<DocId>) {
 }
 
 impl PhotocraftApp {
+    /// Whether the unsaved-changes prompt is up (a shell that handles keys itself leaves Esc to it).
+    pub fn discard_prompt_open(&self) -> bool {
+        self.discard.is_some()
+    }
+
     /// Whether closing now would lose work: a document has unsaved changes and closing wasn't
     /// confirmed. The web build has the browser ask before leaving the page while this holds (#1380).
     pub fn has_unsaved_work(&self) -> bool {
@@ -407,6 +416,29 @@ mod tests {
 
     fn doc_id(app: &PhotocraftApp, i: usize) -> DocId {
         app.session.documents()[i].doc.id
+    }
+
+    /// A shell that has saved a document somewhere safe (`Services::discardable`) is never asked
+    /// about it: closing a tab and quitting skip it, and still ask about the others.
+    #[test]
+    fn a_document_the_shell_saved_safely_asks_nothing() {
+        let mut app = app_with_docs(2);
+        make_dirty(&mut app, 0);
+        make_dirty(&mut app, 1);
+        let safe = doc_id(&app, 0);
+        let other = doc_id(&app, 1);
+        assert!(intercept(&mut app, "file.close", &json!({"document": 0})), "without the hook every unsaved document asks");
+        app.discard = None;
+        app.services.discardable = Some(Box::new(move |docs| docs.iter().filter(|st| st.doc.id == safe).map(|st| st.doc.id).collect()));
+        assert!(!intercept(&mut app, "file.close", &json!({"document": 0})));
+        assert!(app.discard.is_none());
+        assert!(intercept(&mut app, "file.close", &json!({"document": 1})), "the other document still asks");
+        app.discard = None;
+        assert!(intercept(&mut app, EXIT, &Value::Null));
+        assert_eq!(app.discard.as_ref().map(|p| p.docs.clone()), Some(vec![other]), "quitting asks only about the unsafe document");
+        app.discard = None;
+        app.services.discardable = Some(Box::new(|docs| docs.iter().map(|st| st.doc.id).collect()));
+        assert!(!intercept(&mut app, EXIT, &Value::Null));
     }
 
     #[test]

@@ -87,3 +87,48 @@ fn the_home_screens_own_widgets_keep_their_double_clicks() {
     assert_eq!(opens(&requests), 0);
     assert_eq!(h.state().ui.dialogs.len(), 1, "the New Document dialog");
 }
+
+/// A shell with its own project library draws it in place of the stock start screen, both with no
+/// document open and when Home is brought up over open documents; otherwise the editor is untouched.
+#[test]
+fn a_shell_can_draw_its_own_home_screen() {
+    use std::cell::Cell;
+    let drawn = Rc::new(Cell::new(0u32));
+    let count = drawn.clone();
+    let services = Services {
+        home_view: Some(Box::new(move |ui| {
+            count.set(count.get() + 1);
+            ui.label("Project library");
+        })),
+        ..Default::default()
+    };
+    let app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+    let mut h = Harness::builder().with_size(vec2(1200.0, 800.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        |ui, app: &mut PhotocraftApp| {
+            if !ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("medium".into()))) {
+                return;
+            }
+            egui::CentralPanel::default().show(ui, |ui| crate::canvas::document_area(app, ui));
+        },
+        app,
+    );
+    PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::ALL[0]);
+    h.run_steps(4);
+    assert!(drawn.get() > 0, "no document: the shell's library is the start screen");
+    h.get_by_label("Project library");
+    assert!(h.query_by_label_contains("Create a new document or open an existing file").is_none(), "the stock start screen is replaced");
+    // With a document open the editor shows, and Home over it shows the library again.
+    h.state_mut().run("file.new", serde_json::json!({"width": 8, "height": 8})).unwrap();
+    h.state_mut().sync_views();
+    h.run_steps(3);
+    let before = drawn.get();
+    h.run_steps(3);
+    assert_eq!(drawn.get(), before, "the editor, not the library, is drawn");
+    h.state_mut().ui.chrome.home = Some(1);
+    h.run_steps(3);
+    assert!(drawn.get() > before, "Home brings the library up over the open document");
+    // The stock screen is back when the shell takes its view away.
+    h.state_mut().services.home_view = None;
+    h.run_steps(3);
+    h.get_by_label_contains("Create a new document or open an existing file");
+}

@@ -1,13 +1,19 @@
 //! Desktop cloud shell. Snapshot capture is cheap; serialization, linked-file reads, durable
-//! checkpoints, opening and the sync client all run on the worker, independently of Save/recovery.
+//! checkpoints, previews, opening and the sync client all run on the worker, independently of
+//! Save/recovery. The project library (Home) lives in `cloud_home` / `cloud_home_ui`; this file
+//! connects it to the editor and to the worker.
+use crate::cloud_home::{self, CloseDecision, CloudDoc, HomeCommand, HomeReply, HomeWorker};
+use crate::cloud_home_ui::{Action, Busy, Home, Keys, Net};
 use craft_cloud_sync::{Config, DownloadedRevision, Snapshot, SyncEvent, SyncService, SyncStatus};
 use photocraft_doc::{DocId, Document, Layer, LayerContent, SmartSource};
 use photocraft_ui_egui::PhotocraftApp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -22,19 +28,79 @@ struct LocalCopy {
     title: String,
     path: PathBuf,
 }
+/// How long closing a cloud document waits for its checkpoint before the normal prompt is used.
+const FLUSH_WAIT: Duration = Duration::from_secs(5);
+
 enum Command {
-    Save { key: String, doc: Arc<Document>, revision: u64, token: String, source: Option<String> },
+    Save {
+        key: String,
+        doc: Arc<Document>,
+        revision: u64,
+        token: String,
+        source: Option<String>,
+    },
+    /// A [`Command::Save`] whose sender waits to learn whether the checkpoint reached the disk (closing a cloud document).
+    Flush {
+        key: String,
+        doc: Arc<Document>,
+        revision: u64,
+        token: String,
+        source: Option<String>,
+        ack: mpsc::SyncSender<bool>,
+    },
     Connect(Config),
-    Open { path: PathBuf, key: String, binding: Option<(Uuid, Uuid)> },
+    Open {
+        path: PathBuf,
+        key: String,
+        binding: Option<(Uuid, Uuid)>,
+    },
     Refresh,
+    /// The project library: opens, renames, previews, pinning, the cache limit and recents.
+    Home(HomeCommand),
     Stop,
 }
 enum Reply {
-    Ready { endpoint: String, username: String, password: String, connected: bool, credential_notice: String, bindings: HashMap<String, String> },
-    Saved { key: String, revision: u64, source: Option<String>, checkpoint: bool, blocked: bool, result: Result<(), String> },
-    State { status: SyncStatus, pending: usize, catalog: Vec<DownloadedRevision>, local: Vec<LocalCopy> },
-    Opened { key: String, source: Option<String>, from_cloud: bool, result: Result<Box<Document>, String> },
-    Connection { connected: bool, credential_notice: String },
+    Ready {
+        endpoint: String,
+        username: String,
+        password: String,
+        connected: bool,
+        credential_notice: String,
+        bindings: HashMap<String, String>,
+        recents: Vec<(Uuid, u64)>,
+        cache_limit: u64,
+    },
+    Saved {
+        key: String,
+        revision: u64,
+        source: Option<String>,
+        checkpoint: bool,
+        blocked: bool,
+        result: Result<(), String>,
+        /// The project and revision the checkpoint was queued as.
+        submission: Option<(Uuid, Uuid)>,
+    },
+    /// `catalog` holds one entry per head revision.
+    State {
+        status: SyncStatus,
+        pending: usize,
+        catalog: Vec<DownloadedRevision>,
+        local: Vec<LocalCopy>,
+        cache_bytes: u64,
+        cache_limit: u64,
+    },
+    Opened {
+        key: String,
+        source: Option<String>,
+        from_cloud: bool,
+        binding: Option<(Uuid, Uuid)>,
+        result: Result<Box<Document>, String>,
+    },
+    Connection {
+        connected: bool,
+        credential_notice: String,
+    },
+    Home(HomeReply),
     Error(String),
 }
 
@@ -69,6 +135,63 @@ impl Tracked {
     }
 }
 
+/// What the editor's unsaved-changes prompt asks of the adapter (see `Services::discardable`).
+struct CloseGate {
+    docs: HashMap<DocId, GateDoc>,
+    tx: mpsc::Sender<Command>,
+    session_key: String,
+    wait: Duration,
+}
+struct GateDoc {
+    key: String,
+    cloud: bool,
+    durable: Option<u64>,
+}
+impl CloseGate {
+    /// The documents whose current state is safe in a local checkpoint. All missing checkpoints
+    /// are queued first, then share one `wait` budget for the whole Close All / Quit operation.
+    fn allows(&mut self, states: &[&photocraft_engine::DocState]) -> Vec<DocId> {
+        let started = Instant::now();
+        let mut safe = Vec::new();
+        let mut pending = Vec::new();
+        for st in states {
+            let Some(doc) = self.docs.get(&st.doc.id) else { continue };
+            match cloud_home::close_decision(st.path.is_some(), doc.cloud, doc.durable, st.revision) {
+                CloseDecision::Prompt => {}
+                CloseDecision::Safe => safe.push(st.doc.id),
+                CloseDecision::Flush => {
+                let (ack, done) = mpsc::sync_channel(1);
+                    let key = doc.key.clone();
+                    if self
+                        .tx
+                        .send(Command::Flush {
+                    key: doc.key.clone(),
+                    doc: Arc::clone(&st.doc),
+                    revision: st.revision,
+                            token: sync_token(&self.session_key, &key, st.revision),
+                    source: None,
+                    ack,
+                        })
+                        .is_ok()
+                    {
+                        pending.push((st.doc.id, st.revision, done));
+                    }
+                }
+            }
+        }
+        for (id, revision, done) in pending {
+            let remaining = self.wait.saturating_sub(started.elapsed());
+            if done.recv_timeout(remaining).unwrap_or(false) {
+                if let Some(doc) = self.docs.get_mut(&id) {
+                    doc.durable = Some(revision);
+                }
+                safe.push(id);
+            }
+        }
+        safe
+    }
+}
+
 pub struct DesktopApp {
     inner: PhotocraftApp,
     tx: mpsc::Sender<Command>,
@@ -81,20 +204,58 @@ pub struct DesktopApp {
     username: String,
     password: String,
     credential_notice: String,
+    /// The Account window.
     window: bool,
     connected: bool,
     status: SyncStatus,
     pending: usize,
+    /// One entry per head revision, from the worker.
     catalog: Vec<DownloadedRevision>,
     local: Vec<LocalCopy>,
     error: Option<String>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// The project library. Shared with the closure that draws it inside the editor's central area.
+    home: Rc<RefCell<Home>>,
+    gate: Rc<RefCell<CloseGate>>,
+    /// Cloud identity of the open documents.
+    cloud: HashMap<DocId, CloudDoc>,
+    recents: cloud_home::Recents,
+    pinned: BTreeSet<Uuid>,
+    /// The working keys the worker was last told are open.
+    sent_keys: HashSet<String>,
+    cache_limit: u64,
+    /// The limit the sync client reports it is applying (it lags a change by a poll).
+    cache_in_effect: u64,
+    cache_bytes: u64,
+    /// Opens started from Home that wait for their document, by local key.
+    opening: HashMap<String, Uuid>,
+    /// Opens that, once the document exists, go on to Save a Copy.
+    copy_after_open: HashSet<String>,
+    /// Renames of closed projects in flight, by revision, with the title (kept for Retry).
+    renaming: HashMap<Uuid, String>,
+    /// The next untracked document without a file is the one Home's New is creating.
+    awaiting_new: bool,
+    listing_done: bool,
+    sync_seen: bool,
+    settled_polls: u32,
+    cards_dirty: bool,
+    open_titles: HashMap<Uuid, String>,
+    shown_home_once: bool,
+    /// Save a Copy is due: the document it is for was just opened.
+    copy_now: bool,
+    /// `home.*` requests from the control channel.
+    control: Option<mpsc::Receiver<photocraft_ui_egui::ControlRequest>>,
 }
 impl DesktopApp {
     pub fn new(inner: PhotocraftApp, automation: Option<photocraft_automation::AuthorizedWorkspace>) -> Self {
+        Self::new_in(inner, automation, crate::services::config_dir().map(|d| d.join("cloud-projects")))
+    }
+
+    /// [`Self::new`] with the adapter's own directory chosen by the caller (tests use a temporary one).
+    fn new_in(inner: PhotocraftApp, automation: Option<photocraft_automation::AuthorizedWorkspace>, dir: Option<PathBuf>) -> Self {
+        let mut inner = inner;
         let (tx, commands) = mpsc::channel();
         let (replies, rx) = mpsc::channel();
-        let dir = crate::services::config_dir().map(|d| d.join("cloud-projects"));
         let spawn = std::thread::Builder::new().name("photocraft-cloud".into()).spawn(move || {
             if let Some(dir) = dir {
                 worker(commands, replies, dir, automation);
@@ -106,6 +267,19 @@ impl DesktopApp {
             Ok(w) => (Some(w), None),
             Err(e) => (None, Some(format!("Cannot start cloud autosave: {e}"))),
         };
+        let session_key = Uuid::new_v4().to_string();
+        let home = Rc::new(RefCell::new(Home::default()));
+        let gate = Rc::new(RefCell::new(CloseGate { docs: HashMap::new(), tx: tx.clone(), session_key: session_key.clone(), wait: FLUSH_WAIT }));
+        {
+            let view = Rc::clone(&home);
+            inner.services.home_view = Some(Box::new(move |ui| {
+                if let Ok(mut home) = view.try_borrow_mut() {
+                    home.show(ui);
+                }
+            }));
+            let gate = Rc::clone(&gate);
+            inner.services.discardable = Some(Box::new(move |docs| gate.try_borrow_mut().map(|mut g| g.allows(docs)).unwrap_or_default()));
+        }
         Self {
             inner,
             tx,
@@ -113,7 +287,7 @@ impl DesktopApp {
             tracked: HashMap::new(),
             path_bindings: HashMap::new(),
             ready: false,
-            session_key: Uuid::new_v4().to_string(),
+            session_key,
             endpoint: String::new(),
             username: String::new(),
             password: String::new(),
@@ -126,9 +300,31 @@ impl DesktopApp {
             local: Vec::new(),
             error,
             worker,
+            home,
+            gate,
+            cloud: HashMap::new(),
+            recents: cloud_home::Recents::default(),
+            pinned: BTreeSet::new(),
+            sent_keys: HashSet::new(),
+            cache_limit: cloud_home::DEFAULT_CACHE_LIMIT,
+            cache_in_effect: 0,
+            cache_bytes: 0,
+            opening: HashMap::new(),
+            copy_after_open: HashSet::new(),
+            renaming: HashMap::new(),
+            awaiting_new: false,
+            listing_done: false,
+            sync_seen: false,
+            settled_polls: 0,
+            cards_dirty: true,
+            open_titles: HashMap::new(),
+            shown_home_once: false,
+            copy_now: false,
+            control: None,
         }
     }
     fn tick(&mut self, ctx: &egui::Context) {
+        let mut new_projects: Vec<Uuid> = Vec::new();
         loop {
             let reply = match self.rx.try_recv() {
                 Ok(reply) => reply,
@@ -139,16 +335,27 @@ impl DesktopApp {
                 }
             };
             match reply {
-                Reply::Ready { endpoint, username, password, connected, credential_notice, bindings } => {
+                Reply::Ready { endpoint, username, password, connected, credential_notice, bindings, recents, cache_limit } => {
                     self.ready = true;
                     self.path_bindings = bindings;
                     self.endpoint = endpoint;
                     self.username = username;
                     self.password = password;
                     self.connected = connected;
+                    // With no account there is no remote catalog to wait for. `Ready` can arrive
+                    // before the worker's first state poll, so make the empty library usable now.
+                    self.listing_done = !connected;
                     self.credential_notice = credential_notice;
+                    self.recents = cloud_home::Recents::from_entries(recents);
+                    self.cache_limit = cache_limit;
+                    self.cards_dirty = true;
+                    // The library is the start of the app: also when the Home screen preference is off.
+                    if !self.shown_home_once && self.inner.session.documents().is_empty() {
+                        self.inner.ui.chrome.home = Some(0);
+                    }
+                    self.shown_home_once = true;
                 }
-                Reply::Saved { key, revision, source, checkpoint, blocked, result } => {
+                Reply::Saved { key, revision, source, checkpoint, blocked, result, submission } => {
                     for t in self.tracked.values_mut().filter(|t| t.key == key) {
                         if t.pending == Some(revision) {
                             t.pending = None;
@@ -166,62 +373,132 @@ impl DesktopApp {
                             }
                         }
                     }
+                    if let Some((project, version)) = submission {
+                        for (id, t) in &self.tracked {
+                            if t.key != key {
+                                continue;
+                            }
+                            if let Some(doc) = self.cloud.get_mut(id) {
+                                if doc.project.is_none() {
+                                    new_projects.push(project);
+                                }
+                                doc.project = Some(project);
+                                doc.version = Some(version);
+                            }
+                        }
+                    }
                     if let Err(e) = result {
                         self.error = Some(e);
                     } else if self.tracked.values().all(|t| !t.blocked && t.queued == Some(t.observed)) {
                         self.error = None;
                     }
                 }
-                Reply::State { status, pending, catalog, local } => {
+                Reply::State { status, pending, catalog, local, cache_bytes, cache_limit } => {
                     if matches!(status, SyncStatus::Idle) && pending == 0 && self.tracked.values().all(|t| !t.blocked && t.queued == Some(t.observed)) {
                         self.error = None;
                     }
+                    if matches!(status, SyncStatus::Syncing) {
+                        self.sync_seen = true;
+                        self.settled_polls = 0;
+                    } else {
+                        self.settled_polls = self.settled_polls.saturating_add(1);
+                    }
+                    self.listing_done = !self.connected || (self.sync_seen && !matches!(status, SyncStatus::Syncing)) || self.settled_polls >= 3;
                     self.status = status;
                     self.pending = pending;
                     self.catalog = catalog;
                     self.local = local;
+                    self.cache_bytes = cache_bytes;
+                    self.cache_in_effect = cache_limit;
+                    self.cards_dirty = true;
                 }
-                Reply::Opened { key, source, from_cloud, result } => match result {
-                    Ok(doc) => {
-                        if let Some(index) = self.inner.session.documents().iter().position(|d| self.tracked.get(&d.doc.id).is_some_and(|t| t.key == key)) {
-                            self.inner.session.set_active(index);
-                            continue;
+                Reply::Opened { key, source, from_cloud, binding, result } => {
+                    let from_home = self.opening.remove(&key);
+                    match result {
+                        Ok(doc) => {
+                            if let Some(index) = self.inner.session.documents().iter().position(|d| self.tracked.get(&d.doc.id).is_some_and(|t| t.key == key)) {
+                                self.inner.session.set_active(index);
+                                self.set_busy(from_home, None);
+                                continue;
+                            }
+                            let index = open_native_document(&mut self.inner, *doc);
+                            if let Some(d) = self.inner.session.documents().get(index) {
+                                let now = Instant::now();
+                                self.cloud.insert(d.doc.id, CloudDoc { project: binding.map(|b| b.0), version: binding.map(|b| b.1), cloud: from_cloud });
+                                self.tracked.insert(
+                                    d.doc.id,
+                                    Tracked {
+                                        key: key.clone(),
+                                        observed: d.revision,
+                                        durable: Some(d.revision),
+                                        queued: from_cloud.then_some(d.revision),
+                                        blocked: false,
+                                        pending: None,
+                                        changed: now,
+                                        first_change: now,
+                                        doc: Arc::clone(&d.doc),
+                                        source,
+                                    },
+                                );
+                            }
+                            self.set_busy(from_home, None);
+                            new_projects.extend(binding.map(|b| b.0));
+                            if self.copy_after_open.remove(&key) {
+                                self.copy_now = true;
+                            }
                         }
-                        let index = open_native_document(&mut self.inner, *doc);
-                        if let Some(d) = self.inner.session.documents().get(index) {
-                            let now = Instant::now();
-                            self.tracked.insert(
-                                d.doc.id,
-                                Tracked {
-                                    key,
-                                    observed: d.revision,
-                                    durable: Some(d.revision),
-                                    queued: from_cloud.then_some(d.revision),
-                                    blocked: false,
-                                    pending: None,
-                                    changed: now,
-                                    first_change: now,
-                                    doc: Arc::clone(&d.doc),
-                                    source,
-                                },
-                            );
+                        Err(e) => {
+                            self.copy_after_open.remove(&key);
+                            match from_home {
+                                Some(version) => self.set_busy(Some(version), Some(Busy::Failed { error: e, rename: None })),
+                                None => self.error = Some(e),
+                            }
                         }
                     }
-                    Err(e) => self.error = Some(e),
-                },
+                }
                 Reply::Connection { connected, credential_notice } => {
                     self.connected = connected;
                     self.credential_notice = credential_notice;
+                    self.listing_done = !connected;
+                    self.sync_seen = false;
+                    self.settled_polls = 0;
+                    self.cards_dirty = true;
+                }
+                Reply::Home(HomeReply::Failed { version, error }) => {
+                    if version.is_nil() {
+                        self.error = Some(error);
+                    } else {
+                        self.opening.retain(|_, v| *v != version);
+                        let rename = self.renaming.remove(&version);
+                        self.set_busy(Some(version), Some(Busy::Failed { error, rename }));
+                    }
+                    self.cards_dirty = true;
+                }
+                Reply::Home(HomeReply::Renamed { version, new_version }) => {
+                    log::debug!("project revision {version} renamed as {new_version}");
+                    self.renaming.remove(&version);
+                    self.set_busy(Some(version), None);
+                    self.cards_dirty = true;
+                }
+                Reply::Home(HomeReply::Previews(results)) => {
+                    if let Ok(mut home) = self.home.try_borrow_mut() {
+                        home.previews.accept(ctx, results);
+                    }
                 }
                 Reply::Error(e) => self.error = Some(e),
             }
         }
+        for project in new_projects {
+            self.touch_recent(project);
+        }
         if !self.ready {
             ctx.request_repaint_after(Duration::from_millis(250));
+            self.sync_home(ctx);
             return;
         }
         let now = Instant::now();
         for d in self.inner.session.documents() {
+            let fresh = !self.tracked.contains_key(&d.doc.id);
             let t = self.tracked.entry(d.doc.id).or_insert_with(|| Tracked {
                 key: d
                     .path
@@ -238,6 +515,12 @@ impl DesktopApp {
                 doc: Arc::clone(&d.doc),
                 source: d.path.clone(),
             });
+            if fresh {
+                // A document without a file that Home's New just made belongs to the cloud; so does nothing else we did not open.
+                let from_home = self.awaiting_new && d.path.is_none();
+                self.awaiting_new &= !from_home;
+                self.cloud.entry(d.doc.id).or_insert(CloudDoc { project: None, version: None, cloud: from_home });
+            }
             t.observe(d.revision, now);
             t.doc = Arc::clone(&d.doc);
             if let Some(path) = &d.path {
@@ -269,8 +552,13 @@ impl DesktopApp {
                 }
             }
         }
+        // A document that stopped being new (the dialog was cancelled) must not claim the next one.
+        if self.awaiting_new && self.inner.ui.dialogs.is_empty() {
+            self.awaiting_new = false;
+        }
         let closed: Vec<_> = self.tracked.keys().filter(|id| !self.inner.session.documents().iter().any(|d| d.doc.id == **id)).copied().collect();
         for id in closed {
+            self.cloud.remove(&id);
             if let Some(t) = self.tracked.remove(&id)
                 && t.queued != Some(t.observed)
                 && !t.blocked
@@ -285,14 +573,299 @@ impl DesktopApp {
                 });
             }
         }
+        if let Ok(mut gate) = self.gate.try_borrow_mut() {
+            gate.docs = self
+                .tracked
+                .iter()
+                .map(|(id, t)| (*id, GateDoc { key: t.key.clone(), cloud: self.cloud.get(id).is_some_and(|c| c.cloud), durable: t.durable }))
+                .collect();
+        }
+        let keys: HashSet<String> = self.tracked.values().map(|t| t.key.clone()).collect();
+        if keys != self.sent_keys {
+            self.sent_keys = keys.clone();
+            let _ = self.tx.send(Command::Home(HomeCommand::OpenKeys(keys)));
+        }
+        let pinned = cloud_home::pinned_set(self.cloud.values());
+        if pinned != self.pinned {
+            self.pinned = pinned.clone();
+            let _ = self.tx.send(Command::Home(HomeCommand::Pin(pinned)));
+        }
+        self.sync_home(ctx);
+        self.drain_control(ctx);
+        if std::mem::take(&mut self.copy_now) {
+            self.invoke_save_a_copy(ctx);
+        }
         // Required even while typing continuously or while the window is otherwise idle.
         ctx.request_repaint_after(Duration::from_millis(250));
     }
-    fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("Cloud Projects").clicked() {
+
+    /// Feeds the library its model for this frame, sends the previews it wants decoded and carries out what it was asked.
+    fn sync_home(&mut self, ctx: &egui::Context) {
+        let home = Rc::clone(&self.home);
+        let actions = {
+            let Ok(mut home) = home.try_borrow_mut() else { return };
+            let mut titles = HashMap::new();
+            for d in self.inner.session.documents() {
+                if let Some(project) = self.cloud.get(&d.doc.id).and_then(|c| c.project) {
+                    titles.insert(project, d.doc.name.clone());
+                }
+            }
+            if titles != self.open_titles {
+                self.open_titles = titles;
+                self.cards_dirty = true;
+            }
+            let net = match &self.status {
+                SyncStatus::Idle => Net::Idle,
+                SyncStatus::Syncing => Net::Syncing,
+                SyncStatus::Offline => Net::Offline,
+                SyncStatus::Error(e) => Net::Error(e.clone()),
+            };
+            let model = &mut home.model;
+            model.ready = self.ready;
+            model.connected = self.connected;
+            model.net = net;
+            model.listing_done = self.listing_done;
+            model.error = self.error.clone();
+            model.recents = self.recents.ids();
+            model.cache_bytes = self.cache_bytes;
+            model.cache_limit = if self.cache_in_effect == 0 { self.cache_limit } else { self.cache_in_effect };
+            model.documents_open = !self.inner.session.documents().is_empty();
+            model.now_ms = cloud_home::now_ms();
+            if std::mem::take(&mut self.cards_dirty) {
+                let requested: HashSet<Uuid> = model.busy.iter().filter(|(_, b)| matches!(b, Busy::Opening | Busy::Renaming)).map(|(v, _)| *v).collect();
+                model.cards = cloud_home::cards_from_catalog(&self.catalog, &requested, &self.open_titles);
+            }
+            let batch = home.previews.take_batch();
+            if !batch.is_empty() {
+                let _ = self.tx.send(Command::Home(HomeCommand::Previews(batch)));
+            }
+            home.take_actions()
+        };
+        for action in actions {
+            self.perform(ctx, action);
+        }
+    }
+
+    fn set_busy(&mut self, version: Option<Uuid>, busy: Option<Busy>) {
+        let Some(version) = version else { return };
+        if let Ok(mut home) = self.home.try_borrow_mut() {
+            match busy {
+                Some(b) => home.model.busy.insert(version, b),
+                None => home.model.busy.remove(&version),
+            };
+        }
+        self.cards_dirty = true;
+    }
+
+    /// The open document represented by a card. A conflict card selects only the document bound to
+    /// that exact revision; falling back to the project is safe only while it has a single head.
+    fn index_for_card(&self, project: Uuid, version: Uuid) -> Option<usize> {
+        let documents = self.inner.session.documents();
+        let exact = documents.iter().position(|d| self.cloud.get(&d.doc.id).and_then(|c| c.version) == Some(version));
+        if exact.is_some() {
+            return exact;
+        }
+        let heads: HashSet<Uuid> = self
+            .catalog
+            .iter()
+            .filter(|revision| revision.project_id == project && revision.heads.contains(&revision.version_id))
+            .map(|revision| revision.version_id)
+            .collect();
+        if heads.len() != 1 {
+            return None;
+        }
+        documents.iter().position(|d| self.cloud.get(&d.doc.id).and_then(|c| c.project) == Some(project))
+    }
+
+    fn touch_recent(&mut self, project: Uuid) {
+        self.recents.touch(project, cloud_home::now_ms());
+        let _ = self.tx.send(Command::Home(HomeCommand::Recents(self.recents.entries().to_vec())));
+    }
+
+    /// Whether the library is what the central area shows right now.
+    fn home_visible(&mut self) -> bool {
+        let documents = self.inner.session.documents().len();
+        let auto = self.inner.session.prefs().general.auto_show_home_screen;
+        self.inner.ui.chrome.shows_home(documents, auto)
+    }
+
+    fn leave_home(&mut self) {
+        if !self.inner.session.documents().is_empty() {
+            self.inner.ui.chrome.home = None;
+        }
+    }
+
+    fn invoke_save_a_copy(&mut self, ctx: &egui::Context) {
+        match photocraft_ui_egui::menus::invoke(&mut self.inner, ctx, "file.saveACopy", json!({})) {
+            Ok(_) => {}
+            Err(e) if e == "cancelled" => {}
+            Err(e) => {
+                self.inner.ui.status = e;
+                self.inner.ui.status_error = true;
+            }
+        }
+    }
+
+    fn perform(&mut self, ctx: &egui::Context, action: Action) {
+        match action {
+            Action::Open { project, version } => self.open_project(project, version, false),
+            Action::Rename { project, version, title } => self.rename_project(project, version, title),
+            Action::SaveCopy { project, version } => match self.index_for_card(project, version) {
+                Some(index) => {
+                    self.inner.session.set_active(index);
+                    self.invoke_save_a_copy(ctx);
+                }
+                None => self.open_project(project, version, true),
+            },
+            Action::New => {
+                self.awaiting_new = true;
+                if let Err(e) = photocraft_ui_egui::menus::invoke(&mut self.inner, ctx, "file.new", json!({})) {
+                    self.awaiting_new = false;
+                    self.inner.ui.status = e;
+                    self.inner.ui.status_error = true;
+                }
+            }
+            Action::Back => self.leave_home(),
+            Action::Account => {
                 self.window = true;
                 let _ = self.tx.send(Command::Refresh);
+            }
+            Action::RetrySync => {
+                self.error = None;
+                for t in self.tracked.values_mut() {
+                    t.blocked = false;
+                }
+                let _ = self.tx.send(Command::Refresh);
+            }
+        }
+    }
+
+    /// Opens a project: the document that is already open for it, else the revision (downloaded first if it is only in the cloud).
+    fn open_project(&mut self, project: Uuid, version: Uuid, then_copy: bool) {
+        if let Some(index) = self.index_for_card(project, version) {
+            self.inner.session.set_active(index);
+            self.leave_home();
+            self.touch_recent(project);
+            return;
+        }
+        let waiting = self.home.try_borrow().map(|h| matches!(h.model.busy.get(&version), Some(Busy::Opening | Busy::Renaming))).unwrap_or(false);
+        if waiting {
+            return;
+        }
+        let key = format!("cloud-{}", Uuid::new_v4());
+        self.opening.insert(key.clone(), version);
+        if then_copy {
+            self.copy_after_open.insert(key.clone());
+        }
+        self.set_busy(Some(version), Some(Busy::Opening));
+        if self.tx.send(Command::Home(HomeCommand::OpenVersion { project, version, key: key.clone() })).is_err() {
+            self.opening.remove(&key);
+            self.copy_after_open.remove(&key);
+            self.set_busy(Some(version), Some(Busy::Failed { error: "The cloud worker stopped; restart PhotoCraft.".into(), rename: None }));
+        }
+    }
+
+    /// Renames a project: the open document (the next autosave carries the name), else a renamed revision.
+    fn rename_project(&mut self, project: Uuid, version: Uuid, title: String) {
+        let title = match cloud_home::validate_title(&title) {
+            Ok(title) => title,
+            Err(why) => {
+                self.set_busy(Some(version), Some(Busy::Failed { error: why.into(), rename: None }));
+                return;
+            }
+        };
+        if let Some(index) = self.index_for_card(project, version) {
+            let previous = self.inner.session.active_index();
+            self.inner.session.set_active(index);
+            let renamed = self.inner.session.edit("Rename Document", |doc, _| {
+                doc.name.clone_from(&title);
+                Ok(())
+            });
+            if let Some(previous) = previous {
+                self.inner.session.set_active(previous);
+            }
+            match renamed {
+                Ok(()) => self.set_busy(Some(version), None),
+                Err(e) => self.set_busy(Some(version), Some(Busy::Failed { error: e.to_string(), rename: Some(title) })),
+            }
+            self.cards_dirty = true;
+            return;
+        }
+        self.renaming.insert(version, title.clone());
+        self.set_busy(Some(version), Some(Busy::Renaming));
+        if self.tx.send(Command::Home(HomeCommand::Rename { project, version, title: title.clone() })).is_err() {
+            self.renaming.remove(&version);
+            self.set_busy(Some(version), Some(Busy::Failed { error: "The cloud worker stopped; restart PhotoCraft.".into(), rename: Some(title) }));
+        }
+    }
+
+    /// Takes the keys Home uses before the editor's shortcuts see them (Ctrl+F would be Last Filter, F2 Cut, Esc cancels).
+    fn take_home_keys(&mut self, ctx: &egui::Context) {
+        if !self.ready || !self.home_visible() || ctx.text_edit_focused() || self.window {
+            return;
+        }
+        let modal = !self.inner.ui.dialogs.is_empty() || self.inner.file_dialog_open() || self.inner.discard_prompt_open();
+        let keys = ctx.input_mut(|i| Keys {
+            focus_search: i.consume_key(egui::Modifiers::COMMAND, egui::Key::F),
+            rename: !modal && i.consume_key(egui::Modifiers::NONE, egui::Key::F2),
+            leave: !modal && i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+        });
+        if let Ok(mut home) = self.home.try_borrow_mut() {
+            home.keys = keys;
+        }
+    }
+
+    /// Answers `home.*` control requests: read-only listing and open-by-version.
+    fn drain_control(&mut self, ctx: &egui::Context) {
+        let Some(control) = &self.control else { return };
+        let requests: Vec<_> = std::iter::from_fn(|| control.try_recv().ok()).take(16).collect();
+        for request in requests {
+            let reply = if request.deadline.is_some_and(|d| Instant::now() > d) {
+                json!({"ok": false, "error": "timeout: not run — the request was still queued when its deadline passed"})
+            } else {
+                self.control_call(ctx, &request.method, &request.params)
+            };
+            let _ = request.reply.send(reply);
+        }
+    }
+
+    fn control_call(&mut self, ctx: &egui::Context, method: &str, params: &Value) -> Value {
+        match method {
+            "home.list" => {
+                let Ok(home) = self.home.try_borrow() else { return json!({"ok": false, "error": "the library is busy; try again"}) };
+                let net = match &self.status {
+                    SyncStatus::Idle => "idle".to_owned(),
+                    SyncStatus::Syncing => "syncing".to_owned(),
+                    SyncStatus::Offline => "offline".to_owned(),
+                    SyncStatus::Error(e) => format!("error: {e}"),
+                };
+                json!({"ok": true, "result": cloud_home::list_json(&home.model.cards, self.ready, self.connected, &net, cloud_home::now_ms())})
+            }
+            "home.open" => {
+                let Some(version) = params.get("version").and_then(Value::as_str).and_then(|v| Uuid::parse_str(v).ok()) else {
+                    return json!({"ok": false, "error": "`version` must be a revision id from home.list"});
+                };
+                let project = self.home.try_borrow().ok().and_then(|h| h.model.cards.iter().find(|c| c.version == version).map(|c| c.project));
+                let Some(project) = project else { return json!({"ok": false, "error": "no project card has that version; call home.list first"}) };
+                self.perform(ctx, Action::Open { project, version });
+                json!({"ok": true, "result": {"requested": true, "project": project.to_string(), "version": version.to_string()}})
+            }
+            other => json!({"ok": false, "error": format!("unknown method `{other}`")}),
+        }
+    }
+
+    /// Routes `home.*` control requests here (see `cloud_home::split_control`).
+    pub fn with_control(mut self, control: mpsc::Receiver<photocraft_ui_egui::ControlRequest>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let documents = self.inner.session.documents().len();
+            let shown = self.home_visible();
+            if ui.selectable_label(shown, "Home").on_hover_text("Your projects, saved to the cloud").clicked() {
+                self.inner.ui.chrome.home = if shown && documents > 0 { None } else { Some(documents) };
             }
             let unsettled = self.tracked.values().any(|t| t.durable != Some(t.observed));
             let label = if self.error.is_some() || matches!(self.status, SyncStatus::Error(_)) {
@@ -309,7 +882,7 @@ impl DesktopApp {
             ui.small(label).on_hover_text("Cloud autosave is independent of File › Save and crash recovery.");
         });
         let mut open = self.window;
-        egui::Window::new("Cloud Projects").open(&mut open).default_width(520.0).show(ui.ctx(), |ui| {
+        egui::Window::new("Account").open(&mut open).default_width(520.0).show(ui.ctx(), |ui| {
             ui.label("Connect your dedicated HTTPS WebDAV account.");
             ui.horizontal(|ui| {
                 ui.label("Server");
@@ -343,17 +916,25 @@ impl DesktopApp {
                 ui.label(e);
             }
             ui.separator();
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                ui.strong("Projects");
-                for r in self.catalog.iter().filter(|r| r.heads.contains(&r.version_id)) {
-                    revision_row(ui, &self.tx, r, false);
-                }
-                ui.collapsing("History", |ui| {
-                    for r in self.catalog.iter().filter(|r| !r.heads.contains(&r.version_id)) {
-                        revision_row(ui, &self.tx, r, true);
+            ui.horizontal(|ui| {
+                ui.label("Local cache limit");
+                let mut limit = self.cache_limit;
+                egui::ComboBox::from_id_salt("cloud-cache-limit").selected_text(preset_label(limit)).show_ui(ui, |ui| {
+                    for preset in cloud_home::CACHE_PRESETS {
+                        ui.selectable_value(&mut limit, preset, preset_label(preset));
                     }
                 });
-                ui.separator();
+                if limit != self.cache_limit {
+                    self.cache_limit = limit;
+                    let _ = self.tx.send(Command::Home(HomeCommand::CacheLimit(limit)));
+                }
+            });
+            ui.small(format!(
+                "{}. Projects waiting to upload, open documents and conflict copies are never removed.",
+                cloud_home::cache_label(self.cache_bytes, self.cache_limit)
+            ));
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                 ui.strong("Local working copies");
                 for copy in &self.local {
                     ui.horizontal(|ui| {
@@ -370,6 +951,7 @@ impl DesktopApp {
 }
 impl eframe::App for DesktopApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.take_home_keys(ctx);
         self.inner.logic(ctx, frame);
         self.tick(ctx);
     }
@@ -407,6 +989,12 @@ impl eframe::App for DesktopApp {
     }
 }
 
+/// "512 MB", "2 GB": a cache limit preset.
+fn preset_label(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB { format!("{} GB", bytes / GIB) } else { format!("{} MB", bytes / (1024 * 1024)) }
+}
+
 /// Background completion can arrive after the shell's per-frame view synchronization.
 /// Install the document and its UI view together before chrome/canvas rendering begins.
 fn open_native_document(app: &mut PhotocraftApp, document: Document) -> usize {
@@ -415,25 +1003,6 @@ fn open_native_document(app: &mut PhotocraftApp, document: Document) -> usize {
     index
 }
 
-fn revision_row(ui: &mut egui::Ui, tx: &mpsc::Sender<Command>, revision: &DownloadedRevision, history: bool) {
-    ui.horizontal(|ui| {
-        let suffix = if history {
-            format!(" · revision {}", revision.version_id.to_string().chars().take(8).collect::<String>())
-        } else if revision.heads.len() > 1 {
-            format!(" · conflict copy {}/{}", revision.heads.iter().position(|v| *v == revision.version_id).map(|i| i + 1).unwrap_or(1), revision.heads.len())
-        } else {
-            String::new()
-        };
-        ui.label(format!("{}{suffix}", revision.title)).on_hover_text(format!("Revision {}", revision.version_id));
-        if ui.button("Open").clicked() {
-            let _ = tx.send(Command::Open {
-                path: revision.local_path.clone(),
-                key: format!("cloud-{}", Uuid::new_v4()),
-                binding: Some((revision.project_id, revision.version_id)),
-            });
-        }
-    });
-}
 fn load_native_project(path: &Path) -> Result<Document, String> {
     photocraft_format::load_path_with(path, &photocraft_format::LoadOptions { preserve_ids: false, ..Default::default() }).map_err(|e| e.to_string())
 }
@@ -452,7 +1021,7 @@ fn load_native_project_with_access(path: &Path, automation: Option<&photocraft_a
 fn path_key(path: &str) -> String {
     format!("file-{:x}", Sha256::digest(path.as_bytes()))
 }
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp = path.with_extension("tmp");
     let mut file = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
     use std::io::Write;
@@ -709,7 +1278,65 @@ fn open_project(
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .and_then(|v| v.get("source").and_then(Value::as_str).map(str::to_owned));
-    Reply::Opened { key, source, from_cloud: binding.is_some(), result: result.map(Box::new) }
+    Reply::Opened { key, source, from_cloud: binding.is_some(), binding, result: result.map(Box::new) }
+}
+
+/// What writing one checkpoint did.
+struct Checkpointed {
+    /// The native file and its metadata are on disk.
+    durable: bool,
+    /// Publishing is blocked until the document changes (a linked original is missing).
+    blocked: bool,
+    result: Result<(), String>,
+    /// The project and revision the checkpoint was queued as.
+    submission: Option<(Uuid, Uuid)>,
+}
+
+/// Serializes `doc` into a durable local checkpoint (with a bounded preview) and hands it to the sync queue.
+#[allow(clippy::too_many_arguments)]
+fn checkpoint(
+    dir: &Path,
+    service: Option<&SyncService>,
+    automation: Option<&photocraft_automation::AuthorizedWorkspace>,
+    home: &HomeWorker,
+    key: &str,
+    doc: &Arc<Document>,
+    token: &str,
+    source: Option<&str>,
+) -> Checkpointed {
+    let mut durable = false;
+    let mut blocked = false;
+    let mut submission = None;
+    let result = crate::crash_guard::guard("Cloud autosave", || {
+        let portable = portable_with_access(doc, source, automation);
+        let checkpoint_doc = portable.as_ref().unwrap_or(doc);
+        let native = photocraft_format::save_to_bytes(checkpoint_doc, &Default::default()).map_err(|e| e.to_string())?;
+        let hash = format!("{:x}", Sha256::digest(&native));
+        let local_token = format!("{token}:{hash}");
+        let payload = format!("{key}-{hash}.pcraft");
+        atomic_write(&dir.join("working").join(&payload), &native)?;
+        let mut metadata = json!({"key":key,"title":doc.name,"source":source,"payload":payload,"sha256":hash,"local_token":local_token,"portable":portable.is_ok(),"needs_submit":portable.is_ok(),"portability_error":portable.as_ref().err()});
+        let metadata_path = dir.join("working").join(format!("{key}.json"));
+        atomic_write(&metadata_path, &serde_json::to_vec(&metadata).map_err(|e| e.to_string())?)?;
+        durable = true;
+        // The metadata now names this checkpoint: the ones it replaced are no longer needed.
+        cloud_home::prune_superseded(&dir.join("working"), key, &payload);
+        if let Err(error) = portable {
+            blocked = true;
+            return Err(error);
+        }
+        let service = service.ok_or("Saved locally; sync queue unavailable")?;
+        // The checkpoint is already safe on disk; the preview is a courtesy and gives up after a moment.
+        let preview = home.preview(doc);
+        let queued = service
+            .submit(Snapshot { local_key: key.to_owned(), title: doc.name.clone(), extension: "pcraft".into(), local_token, native, preview })
+            .map_err(|e| e.to_string())?;
+        submission = Some((queued.project_id, queued.version_id));
+        metadata["needs_submit"] = json!(false);
+        atomic_write(&metadata_path, &serde_json::to_vec(&metadata).map_err(|e| e.to_string())?)?;
+        Ok(())
+    });
+    Checkpointed { durable, blocked, result, submission }
 }
 
 fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: PathBuf, automation: Option<photocraft_automation::AuthorizedWorkspace>) {
@@ -765,7 +1392,17 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
     } else {
         Config { endpoint: String::new(), username: String::new(), password: String::new() }
     };
-    let _ = replies.send(Reply::Ready { bindings, endpoint, username, password, connected, credential_notice });
+    let (mut home, startup) = HomeWorker::new(&dir);
+    let _ = replies.send(Reply::Ready {
+        bindings,
+        endpoint,
+        username,
+        password,
+        connected,
+        credential_notice,
+        recents: startup.recents,
+        cache_limit: startup.cache_limit,
+    });
     let mut service = match SyncService::new(config, dir.join("sync"), "photocraft") {
         Ok(s) => Some(s),
         Err(e) => {
@@ -773,6 +1410,9 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
             None
         }
     };
+    if let Some(service) = &service {
+        home.apply(service);
+    }
     let mut next_retry = Instant::now();
     let mut awaiting: Vec<AwaitedOpen> = Vec::new();
     loop {
@@ -786,34 +1426,29 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
         }
         match commands.recv_timeout(Duration::from_millis(500)) {
             Ok(Command::Save { key, doc, revision, token, source }) => {
-                let mut durable = false;
-                let mut blocked = false;
-                let result = crate::crash_guard::guard("Cloud autosave", || {
-                    let portable = portable_with_access(&doc, source.as_deref(), automation.as_ref());
-                    let checkpoint_doc = portable.as_ref().unwrap_or(&doc);
-                    let native = photocraft_format::save_to_bytes(checkpoint_doc, &Default::default()).map_err(|e| e.to_string())?;
-                    let hash = format!("{:x}", Sha256::digest(&native));
-                    let local_token = format!("{token}:{hash}");
-                    let payload = format!("{key}-{hash}.pcraft");
-                    atomic_write(&dir.join("working").join(&payload), &native)?;
-                    let mut metadata = json!({"key":key,"title":doc.name,"source":source.clone(),"payload":payload,"sha256":hash,"local_token":local_token,"portable":portable.is_ok(),"needs_submit":portable.is_ok(),"portability_error":portable.as_ref().err()});
-                    let metadata_path = dir.join("working").join(format!("{key}.json"));
-                    atomic_write(&metadata_path, &serde_json::to_vec(&metadata).map_err(|e| e.to_string())?)?;
-                    durable = true;
-                    if let Err(error) = portable {
-                        blocked = true;
-                        return Err(error);
-                    }
-                    service
-                        .as_ref()
-                        .ok_or("Saved locally; sync queue unavailable")?
-                        .submit(Snapshot { local_key: key.clone(), title: doc.name.clone(), extension: "pcraft".into(), local_token, native, preview: None })
-                        .map_err(|e| e.to_string())?;
-                    metadata["needs_submit"] = json!(false);
-                    atomic_write(&metadata_path, &serde_json::to_vec(&metadata).map_err(|e| e.to_string())?)?;
-                    Ok(())
+                let done = checkpoint(&dir, service.as_ref(), automation.as_ref(), &home, &key, &doc, &token, source.as_deref());
+                let _ = replies.send(Reply::Saved {
+                    key,
+                    revision,
+                    source,
+                    checkpoint: done.durable,
+                    blocked: done.blocked,
+                    result: done.result,
+                    submission: done.submission,
                 });
-                let _ = replies.send(Reply::Saved { key, revision, source, checkpoint: durable, blocked, result });
+            }
+            Ok(Command::Flush { key, doc, revision, token, source, ack }) => {
+                let done = checkpoint(&dir, service.as_ref(), automation.as_ref(), &home, &key, &doc, &token, source.as_deref());
+                let _ = ack.send(done.durable);
+                let _ = replies.send(Reply::Saved {
+                    key,
+                    revision,
+                    source,
+                    checkpoint: done.durable,
+                    blocked: done.blocked,
+                    result: done.result,
+                    submission: done.submission,
+                });
             }
             Ok(Command::Connect(config)) => {
                 let credentials = config.clone();
@@ -825,8 +1460,12 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
                     awaiting.clear();
                     let _ = replies.send(Reply::Error("Cloud download interrupted by reconnecting; open the project again".into()));
                 }
+                for reply in home.interrupt() {
+                    let _ = replies.send(Reply::Home(reply));
+                }
                 match SyncService::new(config, dir.join("sync"), "photocraft") {
                     Ok(s) => {
+                        home.apply(&s);
                         service = Some(s);
                         let connected = !credentials.endpoint.is_empty();
                         let credential_notice = if !connected {
@@ -858,7 +1497,10 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
                             dir.join("sync"),
                             "photocraft",
                         ) {
-                            Ok(local) => service = Some(local),
+                            Ok(local) => {
+                                home.apply(&local);
+                                service = Some(local);
+                            }
                             Err(local_error) => {
                                 service = None;
                                 let _ = replies
@@ -881,6 +1523,11 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
             Ok(Command::Refresh) => {
                 if let Some(service) = &service {
                     service.request_sync();
+                }
+            }
+            Ok(Command::Home(command)) => {
+                for reply in home.handle(command, service.as_ref()) {
+                    let _ = replies.send(Reply::Home(reply));
                 }
             }
             Ok(Command::Stop) => {
@@ -911,16 +1558,40 @@ fn worker(commands: mpsc::Receiver<Command>, replies: mpsc::Sender<Reply>, dir: 
                     for open in take_awaited(&mut awaiting, version_id) {
                         let _ = replies.send(open_project(&path, open.key, Some(open.binding), service.as_ref(), automation.as_ref(), &dir));
                     }
+                    let (opens, replies_home) = home.fetched(version_id, service.as_ref());
+                    for open in opens {
+                        let _ = replies.send(open_project(&path, open.key, Some((open.project, open.version)), service.as_ref(), automation.as_ref(), &dir));
+                    }
+                    for reply in replies_home {
+                        let _ = replies.send(Reply::Home(reply));
+                    }
+                }
+                SyncEvent::Published { local_token, .. } => {
+                    if let Some(key) = home.published(&local_token) {
+                        log::debug!("working copy {key} is published and closed: removed");
+                    }
                 }
                 SyncEvent::FetchFailed { version_id, error } => {
                     if !take_awaited(&mut awaiting, version_id).is_empty() {
                         let _ = replies.send(Reply::Error(format!("Cannot open the cloud project: {error}")));
                     }
+                    for reply in home.fetch_failed(version_id, &error) {
+                        let _ = replies.send(Reply::Home(reply));
+                    }
                 }
                 _ => {}
             }
         }
-        let _ = replies.send(Reply::State { status: state.status, pending: state.pending, catalog: state.catalog, local: local_copies(&dir.join("working")) });
+        // The library lists heads only; older revisions stay in the shared client.
+        let heads: Vec<_> = state.catalog.into_iter().filter(|r| r.heads.contains(&r.version_id)).collect();
+        let _ = replies.send(Reply::State {
+            status: state.status,
+            pending: state.pending,
+            catalog: heads,
+            local: local_copies(&dir.join("working")),
+            cache_bytes: state.cache_bytes,
+            cache_limit: state.cache_limit,
+        });
     }
 }
 
@@ -1300,3 +1971,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(test)]
+mod home_tests;

@@ -428,6 +428,11 @@ pub type CapsLockFn = Box<dyn FnMut() -> bool>;
 pub type WindowFrameFn = Box<dyn FnMut()>;
 /// The caption buttons' current style ([`Services::caption_style`]).
 pub type CaptionStyleFn = Box<dyn Fn(&egui::Context) -> CaptionStyle>;
+/// Draws the Home screen's content in the central area (see [`Services::home_view`]).
+pub type HomeViewFn = Box<dyn FnMut(&mut egui::Ui)>;
+/// Which documents in a close operation already have their unsaved changes safe elsewhere (see
+/// [`Services::discardable`]). The batch keeps a shell's bounded flush wait global to Close All / Quit.
+pub type DiscardableFn = Box<dyn Fn(&[&photocraft_engine::DocState]) -> Vec<DocId>>;
 
 /// Platform services injected by the app binary (file dialogs, codecs), keeping this crate free of
 /// I/O dependencies.
@@ -522,6 +527,20 @@ pub struct Services {
     /// while AppKit's run loop is still going crashes or hangs Touch Bar Macs (#1575, #1458).
     /// Without one, eframe closes the window and the app ends with it.
     pub quit: Option<QuitFn>,
+    /// Replaces the start screen (the Home screen) in the central area, for a shell that has its
+    /// own project library. It only draws; the shell reads its answers back from its own state.
+    pub home_view: Option<HomeViewFn>,
+    /// Asked once before an unsaved-changes prompt, with all dirty documents the operation would
+    /// discard. The returned ids have their current state safe elsewhere (for example in a durable
+    /// cloud checkpoint), so they need no prompt. Without one every unsaved document asks.
+    pub discardable: Option<DiscardableFn>,
+}
+
+impl Services {
+    /// The documents the shell reports safe to discard ([`Self::discardable`]).
+    pub fn discardable_documents(&self, docs: &[&photocraft_engine::DocState]) -> Vec<DocId> {
+        self.discardable.as_ref().map(|safe| safe(docs)).unwrap_or_default()
+    }
 }
 
 /// A document histogram being computed off the UI thread: (document, revision, receiver of

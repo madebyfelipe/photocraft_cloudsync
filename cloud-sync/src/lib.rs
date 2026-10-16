@@ -135,9 +135,9 @@ pub struct SyncState {
     pub pending: usize,
     pub catalog: Vec<DownloadedRevision>,
     pub events: Vec<SyncEvent>,
-    /// Bytes currently used by cached payloads.
+    /// Bytes currently used by cached payloads and previews.
     pub cache_bytes: u64,
-    /// Payload cache limit in bytes (default 2 GiB); see `SyncService::set_cache_limit`.
+    /// Payload and preview cache limit in bytes (default 2 GiB); see `SyncService::set_cache_limit`.
     pub cache_limit: u64,
 }
 impl Default for SyncState {
@@ -274,11 +274,25 @@ impl SyncService {
         };
         let mut all: BTreeMap<Uuid, Manifest> = BTreeMap::new();
         for entry in fs::read_dir(cache.join("manifests"))? {
-            let path = entry?.path();
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
             if path.extension().and_then(|v| v.to_str()) == Some("json") {
-                let m: Manifest = serde_json::from_slice(&bounded_file(&path, MAX_MANIFEST)?)?;
-                validate(&m, app)?;
-                all.insert(m.version, m);
+                let loaded = bounded_file(&path, MAX_MANIFEST)
+                    .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).map_err(Error::from))
+                    .and_then(|manifest| {
+                        validate(&manifest, app)?;
+                        Ok(manifest)
+                    });
+                match loaded {
+                    Ok(manifest) => {
+                        all.insert(manifest.version, manifest);
+                    }
+                    Err(_) => {
+                        // Published manifests are a rebuildable cache. A single damaged entry must
+                        // not make every project disappear; the next online listing restores it.
+                        let _ = fs::remove_file(&path);
+                    }
+                }
             }
         }
         let pending: BTreeSet<Uuid> = j.pending.iter().map(|p| p.manifest.version).collect();
@@ -306,7 +320,7 @@ impl SyncService {
             }
         }
         let initial = build_catalog(&cache, all.values(), &pending);
-        let state = SyncState { catalog: initial, cache_bytes: payload_bytes(&cache), ..SyncState::default() };
+        let state = SyncState { catalog: initial, cache_bytes: cache_bytes(&cache), ..SyncState::default() };
         let shared = Arc::new(Mutex::new(Shared { journal: j, state, ..Shared::default() }));
         let stop = Arc::new(AtomicBool::new(false));
         if let Some(ref mut r) = remote {
@@ -527,20 +541,18 @@ impl Submitter {
         let _ = self.wake.send(());
         Ok(Submission { project_id, version_id: version })
     }
-    /// Asks the worker to download and verify a revision's payload. Answered by `SyncEvent::Fetched` or `SyncEvent::FetchFailed`;
-    /// an already cached payload is answered immediately.
+    /// Asks the worker to verify or download a revision's payload. Answered by `SyncEvent::Fetched` or
+    /// `SyncEvent::FetchFailed`. Cached payloads are also verified by checksum on the worker so a
+    /// same-sized damaged file is never handed to an application.
     pub fn request_payload(&self, version_id: Uuid) {
         let mut st = lock(&self.shared);
         let item = st.state.catalog.iter().find(|r| r.version_id == version_id).cloned();
-        let Some(item) = item else {
+        let Some(_item) = item else {
             st.state.events.push(SyncEvent::FetchFailed { version_id, error: "revision is not in the catalog".into() });
             return;
         };
         if self.stop.load(Ordering::Acquire) {
             st.state.events.push(SyncEvent::FetchFailed { version_id, error: "sync service has stopped".into() });
-        } else if fs::metadata(&item.local_path).is_ok_and(|f| f.len() == item.size) {
-            touch(&mut st, [version_id]);
-            st.state.events.push(SyncEvent::Fetched { project_id: item.project_id, version_id, path: item.local_path });
         } else {
             st.requests.insert(version_id);
             drop(st);
@@ -554,7 +566,7 @@ impl Submitter {
         touch(&mut st, touched);
         st.pinned = versions;
     }
-    /// Sets the payload cache limit in bytes and evicts least-recently-used payloads right away if needed.
+    /// Sets the payload and preview cache limit in bytes and evicts safe least-recently-used files right away if needed.
     pub fn set_cache_limit(&self, bytes: u64) {
         let mut st = lock(&self.shared);
         st.state.cache_limit = bytes;
@@ -832,29 +844,46 @@ fn sync(r: &Remote, c: &Path, app: &str, s: &Mutex<Shared>, stop: &AtomicBool) -
         if fresh.contains(&m.version) {
             atomic(&c.join("manifests").join(format!("{}.json", m.version)), &serde_json::to_vec(m)?)?;
         }
-        if let Some(pr) = &m.preview {
-            fetch_preview(r, c, s, m.version, pr)?;
-        }
         catalog.push(revision(c, m, pending.contains(&m.version)));
     }
     refresh_heads(&mut catalog);
-    let mut shared = lock(s);
-    let known: BTreeSet<Uuid> = shared.state.catalog.iter().map(|v| v.version_id).collect();
-    for item in &catalog {
-        if !known.contains(&item.version_id) {
-            shared.state.events.push(SyncEvent::Downloaded(item.clone()));
+    {
+        // Publish valid metadata before downloading optional previews. A slow or disconnected
+        // thumbnail must not hide every project whose manifest was already validated.
+        let mut shared = lock(s);
+        let known: BTreeSet<Uuid> = shared.state.catalog.iter().map(|v| v.version_id).collect();
+        for item in &catalog {
+            if !known.contains(&item.version_id) {
+                shared.state.events.push(SyncEvent::Downloaded(item.clone()));
+            }
+        }
+        let listed: BTreeSet<Uuid> = catalog.iter().map(|v| v.version_id).collect();
+        for item in &shared.state.catalog {
+            if !listed.contains(&item.version_id) {
+                catalog.push(item.clone());
+            }
+        }
+        refresh_heads(&mut catalog);
+        shared.state.catalog = catalog;
+        shared.confirmed = listed;
+        evict(c, &mut shared);
+    }
+
+    for m in &manifests {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(pr) = &m.preview {
+            let fetched = fetch_preview(r, c, s, m.version, pr);
+            let path = preview_file(c, m.version);
+            let mut shared = lock(s);
+            for item in shared.state.catalog.iter_mut().filter(|item| item.version_id == m.version) {
+                item.preview_path = path.is_file().then(|| path.clone());
+            }
+            drop(shared);
+            fetched?;
         }
     }
-    let listed: BTreeSet<Uuid> = catalog.iter().map(|v| v.version_id).collect();
-    for item in &shared.state.catalog {
-        if !listed.contains(&item.version_id) {
-            catalog.push(item.clone());
-        }
-    }
-    refresh_heads(&mut catalog);
-    shared.state.catalog = catalog;
-    shared.confirmed = listed;
-    evict(c, &mut shared);
     Ok(())
 }
 /// Downloads a revision's preview unless it is already stored. A preview that fails verification is skipped and reported once;
@@ -927,6 +956,11 @@ fn fetch_payload(r: Option<&Remote>, c: &Path, app: &str, v: Uuid) -> Result<Pat
     if bounded_file(&path, MAX_PAYLOAD).is_ok_and(|b| sound(&b)) {
         return Ok(path);
     }
+    // Size alone is not proof of integrity. Remove any unusable local object before reporting an
+    // offline failure or installing a verified remote replacement, so `cached` cannot remain true.
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
     let r = r.ok_or_else(|| Error(OFFLINE_FETCH.into()))?;
     let b = r.get(&format!("{v}.payload"), m.size)?.ok_or_else(|| Error("published revision payload missing".into()))?;
     if !sound(&b) {
@@ -942,23 +976,27 @@ fn touch(st: &mut Shared, versions: impl IntoIterator<Item = Uuid>) {
         st.dirty = true;
     }
 }
-fn payload_bytes(c: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(c.join("payloads")) else { return 0 };
+fn directory_bytes(path: PathBuf) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else { return 0 };
     let named = entries.flatten().filter(|e| e.file_name().to_str().is_some_and(|n| Uuid::parse_str(n).is_ok()));
     named.filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).fold(0, |total: u64, m| total.saturating_add(m.len()))
 }
+fn cache_bytes(c: &Path) -> u64 {
+    directory_bytes(c.join("payloads")).saturating_add(directory_bytes(c.join("previews")))
+}
 /// Deletes least-recently-used payloads while the cache exceeds its limit. Never deletes pending revisions, pinned revisions,
 /// heads of projects with several heads, revisions not confirmed on the remote, or payloads used within the last minute.
-/// Manifests and previews are kept.
+/// Published previews are rebuildable and are removed after payload candidates when the combined cache is still over its limit.
+/// Manifests are the small offline catalog and are kept.
 fn evict(c: &Path, st: &mut Shared) {
     let now = now_ms().unwrap_or(0);
     let known: BTreeSet<Uuid> = st.state.catalog.iter().map(|r| r.version_id).collect();
     let before = st.journal.access.len();
     st.journal.access.retain(|v, _| known.contains(v));
     st.dirty |= st.journal.access.len() != before;
-    let mut used = payload_bytes(c);
+    let mut used = cache_bytes(c);
+    let pending: BTreeSet<Uuid> = st.journal.pending.iter().map(|p| p.manifest.version).collect();
     if used > st.state.cache_limit {
-        let pending: BTreeSet<Uuid> = st.journal.pending.iter().map(|p| p.manifest.version).collect();
         let conflicts: BTreeSet<Uuid> = st.state.catalog.iter().filter(|r| r.heads.len() > 1).flat_map(|r| r.heads.iter().copied()).collect();
         let mut victims: Vec<_> = (st.state.catalog.iter())
             .filter(|r| r.cached && st.confirmed.contains(&r.version_id))
@@ -976,8 +1014,27 @@ fn evict(c: &Path, st: &mut Shared) {
             }
         }
     }
+    if used > st.state.cache_limit {
+        let mut previews: Vec<_> = st
+            .state
+            .catalog
+            .iter()
+            .filter(|r| r.preview_path.is_some() && st.confirmed.contains(&r.version_id) && !pending.contains(&r.version_id))
+            .filter(|r| st.journal.access.get(&r.version_id).is_none_or(|t| now.saturating_sub(*t) >= RECENT_MS))
+            .filter_map(|r| fs::metadata(preview_file(c, r.version_id)).ok().map(|m| (st.journal.access.get(&r.version_id).copied().unwrap_or(0), r.created_ms, r.version_id, m.len())))
+            .collect();
+        previews.sort();
+        for (_, _, version, size) in previews {
+            if used <= st.state.cache_limit {
+                break;
+            }
+            if fs::remove_file(preview_file(c, version)).is_ok() {
+                used = used.saturating_sub(size);
+            }
+        }
+    }
     refresh_flags(c, st);
-    st.state.cache_bytes = payload_bytes(c);
+    st.state.cache_bytes = cache_bytes(c);
     if std::mem::take(&mut st.dirty) {
         let _ = journal(c, &st.journal);
     }
@@ -987,6 +1044,9 @@ fn refresh_flags(c: &Path, st: &mut Shared) {
     for r in &mut st.state.catalog {
         r.pending = pending.contains(&r.version_id);
         r.cached = fs::metadata(payload(c, r.version_id)).is_ok_and(|f| f.len() == r.size);
+        if r.preview_path.as_ref().is_some_and(|path| !path.is_file()) {
+            r.preview_path = None;
+        }
     }
 }
 /// Event queue bound: when full, plain `Downloaded` notifications go first so fetch results are not lost behind a large first sync.
@@ -1013,7 +1073,11 @@ fn enqueue(c: &Path, st: &mut Shared, m: Manifest, native: &[u8], preview: Optio
     edit(&mut next);
     journal(c, &next)?;
     st.journal = next;
-    st.state.cache_bytes = st.state.cache_bytes.saturating_add(native.len() as u64);
+    st.state.cache_bytes = st
+        .state
+        .cache_bytes
+        .saturating_add(native.len() as u64)
+        .saturating_add(preview.map_or(0, |bytes| bytes.len() as u64));
     st.state.catalog.push(revision(c, &m, true));
     refresh_heads(&mut st.state.catalog);
     st.state.events.push(SyncEvent::Durable { project_id: m.project, version_id: m.version, local_token: token.into() });
@@ -1565,9 +1629,20 @@ mod tests {
         assert_eq!((fs::read(&path).unwrap(), project_id, path), (b"native bytes".to_vec(), sub.project_id, rev.local_path.clone()));
         let after = b.poll();
         assert!(after.catalog[0].cached && after.cache_bytes == 12 && after.cache_limit == DEFAULT_CACHE_LIMIT);
-        // An already cached payload is answered immediately, on the caller thread.
+        // An already cached payload is re-verified by the worker before it is returned.
         b.request_payload(v);
-        assert!(matches!(&b.poll().events[..], [SyncEvent::Fetched { .. }]));
+        let (_, cached_path) = await_event(&b, &mut seen, fetched(v));
+        assert_eq!(cached_path, rev.local_path);
+        // Same-sized corruption is not trusted. Offline verification removes it and reports a
+        // retryable fetch failure instead of returning damaged native bytes.
+        fs::write(payload(ca.path(), v), b"NATIVE BYTES").unwrap();
+        settle(&a);
+        let mut offline_seen = Vec::new();
+        a.request_payload(v);
+        let error = await_event(&a, &mut offline_seen, failed(Some(v)));
+        assert!(error.starts_with("offline"), "{error}");
+        assert!(!payload(ca.path(), v).exists());
+        assert!(!a.poll().catalog[0].cached);
         assert_eq!(errors(&seen), 0);
     }
     #[test]
@@ -1717,6 +1792,25 @@ mod tests {
         assert!(SyncService::new(config(), c.path(), "photocraft").is_err());
         fs::write(payload(c.path(), pending), b"native bytez").unwrap();
         assert!(SyncService::new(config(), c.path(), "photocraft").is_err());
+    }
+    #[test]
+    fn startup_quarantines_a_damaged_published_manifest_and_refetches_it() {
+        let d = Dav::new();
+        let r = d.remote();
+        let c = tempfile::tempdir().unwrap();
+        let mut first = offline(c.path());
+        let saved = first.submit(snap("recover-manifest")).unwrap();
+        run(&r, c.path(), &first);
+        first.shutdown();
+        drop(first);
+        let manifest_path = c.path().join("manifests").join(format!("{}.json", saved.version_id));
+        fs::write(&manifest_path, b"damaged cached manifest").unwrap();
+
+        let restored = connected(&d, c.path());
+        let mut seen = Vec::new();
+        let revision = await_event(&restored, &mut seen, downloaded(saved.version_id));
+        assert_eq!((revision.project_id, revision.version_id), (saved.project_id, saved.version_id));
+        assert!(load_manifest(c.path(), saved.version_id, "photocraft").is_ok());
     }
     #[test]
     fn eviction_is_lru_and_never_removes_protected_revisions() {
@@ -1932,8 +2026,10 @@ mod tests {
         assert_eq!(errors(&seen), 0);
         assert!(!b.poll().catalog[0].cached);
         // A revision cached locally is still available offline.
+        let mut cached_seen = Vec::new();
         a.request_payload(sub.version_id);
-        assert!(matches!(&a.poll().events.last(), Some(SyncEvent::Fetched { path, .. }) if path == &payload(ca.path(), sub.version_id)));
+        let (_, path) = await_event(&a, &mut cached_seen, fetched(sub.version_id));
+        assert_eq!(path, payload(ca.path(), sub.version_id));
     }
     #[test]
     fn journal_written_before_previews_and_access_tracking_still_loads() {

@@ -27,6 +27,8 @@ mod appearance;
 mod apple_events;
 mod caps_lock;
 mod caption_style;
+mod cloud_home;
+mod cloud_home_ui;
 mod cloud_sync;
 mod control_server;
 mod crash_guard;
@@ -470,9 +472,13 @@ fn main() -> eframe::Result {
                     log::warn!("couldn't remember GPU backend {}: {e}", b.name());
                 }
             });
+            // `home.*` control requests go to the project library, everything else to the editor.
+            let mut home_control = None;
             if let Some((port, token, _)) = control {
                 let rx = control_server::start(port, token, cc.egui_ctx.clone());
-                app = app.with_control(rx);
+                let (editor_rx, home_rx) = cloud_home::split_control(rx, cc.egui_ctx.clone());
+                app = app.with_control(editor_rx);
+                home_control = Some(home_rx);
             }
             #[cfg(target_os = "macos")]
             {
@@ -520,7 +526,11 @@ fn main() -> eframe::Result {
             if let Some(w) = &app_dirs::current().warning {
                 photocraft_ui_egui::notices::post(&mut app, "Portable mode is off", vec![w.clone()], false, None);
             }
-            Ok(Box::new(cloud_sync::DesktopApp::new(app, automation)))
+            let mut desktop = cloud_sync::DesktopApp::new(app, automation);
+            if let Some(home_control) = home_control {
+                desktop = desktop.with_control(home_control);
+            }
+            Ok(Box::new(desktop))
         }),
     );
     // Closed or failed outside graphics initialization: not a driver crash. A renderer error
