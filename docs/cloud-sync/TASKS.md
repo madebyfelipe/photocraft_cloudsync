@@ -8,9 +8,9 @@
 | IMPL-04 | Concluído | Janela de projetos e estados nos dois editores; capturas inspecionadas |
 | QA-01 | Concluído | Photo 9 testes/Vector 10; ambos iniciados, checkpoints lidos e projetos reabertos após reinício |
 | QA-02 | Concluído no cliente | Reinício offline, idempotência, status e dois clientes com rclone real |
-| QA-03 | Parcial | Duas instâncias locais por HTTPS aprovadas; faltam VPS e dois computadores reais |
+| QA-03 | Parcial | VPS por túnel SSH (dois clientes, ramos concorrentes, reinício offline) e preflight HTTPS público aprovados em 2026-10-15; faltam dois computadores físicos e Windows/macOS |
 | DOC-01 | Concluído | STATE/CODEMAP/TASKS/TESTS atualizados; script inteiro reexecutado com exit 0; instalação/start salvos em rascunho, publicação pendente |
-| DEPLOY-01 | Aguardando infraestrutura | Domínio/DNS, acesso e revisão da configuração da Contabo; nada implantado |
+| DEPLOY-01 | Concluído | rclone WebDAV na VPS atrás do Caddy existente, `https://cloudsync.madebyfelipe.agency/` com Let’s Encrypt, preflight aprovado (2026-10-15); backup externo pendente |
 | HOME-01 | TODO | Tela inicial estilo Figma para PhotoCraft e VectorCraft, com todos os projetos/posts, prévias e abertura pela nuvem; escopo abaixo |
 
 ## HOME-01 — tela inicial de projetos na nuvem
